@@ -376,9 +376,6 @@ public class SleighLanguage implements Language {
 					instructProtoMap.put(hashcode, newProto);
 					res = newProto;
 				}
-				if (inDelaySlot && res.hasDelaySlots()) {
-					throw new NestedDelaySlotException();
-				}
 			}
 		}
 		catch (MemoryAccessException e) {

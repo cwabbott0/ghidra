@@ -20,6 +20,7 @@
 package ghidra.app.plugin.processors.sleigh;
 
 import java.util.ArrayList;
+import java.util.Iterator;
 
 import ghidra.app.plugin.processors.sleigh.symbol.*;
 import ghidra.app.plugin.processors.sleigh.template.*;
@@ -58,6 +59,7 @@ public abstract class PcodeEmit {
 	private int labelbase = 0;
 	private int labelcount = 0;
 	private boolean inDelaySlot = false;				// Are we currently emitting delayslot p-code
+	private Address postponedDelaySlot = null;
 	private AddressSpace const_space;
 	private AddressSpace uniq_space;
 	private long uniquemask;
@@ -563,12 +565,12 @@ public abstract class PcodeEmit {
 				buildEmpty(ct, secnum);
 			}
 			else {
-				build(construct, secnum);
+				buildNonEmpty(construct, secnum);
 			}
 		}
 		else {
 			ConstructTpl construct = ct.getTempl();
-			build(construct, -1);
+			buildNonEmpty(construct, -1);
 		}
 		walker.popOperand();
 	}
@@ -602,10 +604,26 @@ public abstract class PcodeEmit {
 				throw new UnknownInstructionException(
 					"Could not find cached delayslot parser context");
 			}
+			if (parsercontext.getPrototype().hasDelaySlots()) {
+				/*
+				 * If we see two instructions in a row, both with delay slots, it's not always
+				 * clear what to do. We choose to do something somewhat sensible, and interpret
+				 * it as if the first instruction doesn't have a delay slot at all by delaying
+				 * the emission of the second instruction until after the first is done. This is
+				 * required on some architectures, where it's legal to have two branches with
+				 * delay slots in a row as long as they don't both jump to different addresses.
+				 */
+				if (postponedDelaySlot != null) {
+					throw new SleighException(
+							"More than one delay slot for Instruction at " + walker.getAddr());
+				}
+				postponedDelaySlot = addr;
+				break;
+			}
 			int len = parsercontext.getPrototype().getLength();
 			walker = new ParserWalker(parsercontext);
 			walker.baseState();
-			build(walker.getConstructor().getTempl(), -1);
+			buildNonEmpty(walker.getConstructor().getTempl(), -1);
 			falloffset += len;
 			bytecount += len;
 		}
@@ -656,20 +674,15 @@ public abstract class PcodeEmit {
 			buildEmpty(ct, secnum);
 		}
 		else {
-			build(construct, secnum);
+			buildNonEmpty(construct, secnum);
 		}
 		walker = oldwalker;
 		parsercontext = walker.getParserContext();
 		uniqueoffset = olduniqueoffset;
 	}
-
-	public void build(ConstructTpl construct, int secnum)
+	
+	private void buildNonEmpty(ConstructTpl construct, int secnum)
 			throws UnknownInstructionException, MemoryAccessException {
-		if (construct == null) {
-			throw new NotYetImplementedException(
-				"Semantics for this instruction are not implemented");
-		}
-
 		int oldbase = labelbase;	// Recursively save old labelbase
 		labelbase = labelcount;
 		labelcount += construct.getNumLabels();
@@ -722,9 +735,34 @@ public abstract class PcodeEmit {
 				buildEmpty(walker.getConstructor(), secnum);
 			}
 			else {
-				build(construct, secnum);
+				buildNonEmpty(construct, secnum);
 			}
 			walker.popOperand();
+		}
+	}
+	
+	public void build(ConstructTpl construct, int secnum)
+			throws UnknownInstructionException, MemoryAccessException {
+		if (construct == null) {
+			throw new NotYetImplementedException(
+				"Semantics for this instruction are not implemented");
+		}
+
+		buildNonEmpty(construct, secnum);
+		while (postponedDelaySlot != null) {
+			try {
+				parsercontext = (SleighParserContext) instcontext.getParserContext(postponedDelaySlot);
+			}
+			catch (UnknownContextException e) {
+				throw new UnknownInstructionException(
+					"Could not find cached delayslot parser context");
+			}
+			setUniqueOffset(postponedDelaySlot);
+			
+			walker = new ParserWalker(parsercontext);
+			walker.baseState();
+			postponedDelaySlot = null;
+			buildNonEmpty(walker.getConstructor().getTempl(), -1);
 		}
 	}
 

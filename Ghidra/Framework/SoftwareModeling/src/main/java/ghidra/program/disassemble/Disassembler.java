@@ -1162,6 +1162,9 @@ public class Disassembler implements DisassemblerConflictHandler {
 			for (PseudoInstruction dsInstr : delaySlotList) {
 				block.addInstruction(dsInstr);
 				dsInstr.setInstructionBlock(block);
+				if (followFlow) {
+					processInstructionFlows(dsInstr, block);
+				}
 			}
 		}
 
@@ -1295,6 +1298,7 @@ public class Disassembler implements DisassemblerConflictHandler {
 
 				length = dsInstr.getLength();
 				minDelaySlotBytes -= length;
+				minDelaySlotBytes = Integer.max(minDelaySlotBytes, prototype.getDelaySlotByteCount());
 			}
 			return instrList;
 		}

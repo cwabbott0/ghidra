@@ -136,6 +136,10 @@ public class ParserWalker {
 	public int getOperand() {
 		return breadcrumb[depth];
 	}
+	
+	public int getDepth() {
+		return depth;
+	}
 
 	public FixedHandle getFixedHandle(int i) {
 		return context.getFixedHandle(point.getSubState(i));
