@@ -3415,6 +3415,50 @@ void ActionConditionalConst::propagateConstant(Varnode *varVn,Varnode *constVn,F
   }
 }
 
+/// \brief Replace comparisons of a given Varnode with a constant.
+///
+/// For each read op, check that is in or dominated by a specific block we known
+/// the Varnode is not equal to a constant in.
+/// \param varVn is the given Varnode
+/// \param constVn is the constant Varnode to check
+/// \param constBlock is the block which dominates ops reading the constant value
+/// \param data is the function being analyzed
+void ActionConditionalConst::propagateNonConstant(Varnode *varVn,Varnode *constVn,FlowBlock *nonconstBlock,Funcdata &data)
+
+{
+  list<PcodeOp *>::const_iterator iter,enditer;
+  iter = varVn->beginDescend();
+  enditer = varVn->endDescend();
+  FlowBlock *rootBlock = (FlowBlock *)0;
+  if (varVn->isWritten())
+    rootBlock = varVn->getDef()->getParent();
+  while(iter != enditer) {
+    PcodeOp *op = *iter;
+    ++iter;		// Advance iterator before possibly destroying descendant
+    if (op->getOut() == (Varnode*)0 || !op->getOut()->isHeritageKnown()) continue;
+    bool isEqual;
+    if (op->code() == CPUI_INT_EQUAL)
+      isEqual = true;
+    else if (op->code() == CPUI_INT_NOTEQUAL)
+      isEqual = false;
+    else
+      continue;
+    Varnode *otherVn = op->getIn(1 - op->getSlot(varVn));
+    if (!otherVn->isConstant()) continue;
+    if (otherVn->getOffset() != constVn->getOffset()) continue;
+    FlowBlock *bl = op->getParent();
+    while(bl != (FlowBlock *)0) {
+      if (bl == rootBlock) break;
+      if (bl == nonconstBlock) {		// Is op dominated by nonconstBlock?
+    	data.totalReplaceConstant(op->getOut(), !isEqual);
+    	count += 1;			// We made a change
+    	break;
+      }
+      bl = bl->getImmedDom();
+    }
+  }
+}
+
 int4 ActionConditionalConst::apply(Funcdata &data)
 
 {
@@ -3455,8 +3499,13 @@ int4 ActionConditionalConst::apply(Funcdata &data)
     if (flipEdge)
       constEdge = 1 - constEdge;
     FlowBlock *constBlock = bl->getOut(constEdge);
-    if (!constBlock->restrictedByConditional(bl)) continue;	// Make sure condition holds
-    propagateConstant(varVn,constVn,constBlock,data);
+    FlowBlock *nonconstBlock = bl->getOut(1 - constEdge);
+    if (constBlock->restrictedByConditional(bl)) {	// Make sure condition holds
+      propagateConstant(varVn,constVn,constBlock,data);
+    }
+    if (nonconstBlock->restrictedByConditional(bl)) {
+      propagateNonConstant(varVn,constVn,nonconstBlock,data);
+    }
   }
   return 0;
 }

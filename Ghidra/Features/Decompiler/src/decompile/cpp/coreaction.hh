@@ -546,6 +546,7 @@ public:
   }
   virtual int4 apply(Funcdata &data);
   void propagateConstant(Varnode *varVn,Varnode *constVn,FlowBlock *constBlock,Funcdata &data);
+  void propagateNonConstant(Varnode *varVn,Varnode *constVn,FlowBlock *nonconstBlock,Funcdata &data);
 };
 
 /// \brief Normalize jump-table construction.
