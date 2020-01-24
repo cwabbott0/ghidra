@@ -16,6 +16,7 @@
 #include "heritage.hh"
 #include "funcdata.hh"
 #include "prefersplit.hh"
+#include <limits.h>
 
 /// Update disjoint cover making sure (addr,size) is contained in a single element
 /// and return iterator to this element. Pass back \b intersect value:
@@ -1848,7 +1849,6 @@ void Heritage::processJoins(void)
     Varnode *vn = *iter++;
     if (vn->getSpace() != joinspace) break;	// New varnodes may get inserted before enditer
     JoinRecord *joinrec = fd->getArch()->findJoin(vn->getOffset());
-    AddrSpace *piecespace = joinrec->getPiece(0).space;
 
     if (joinrec->getUnified().size != vn->getSize())
       throw LowlevelError("Joined varnode does not match size of record");
@@ -1859,8 +1859,14 @@ void Heritage::processJoins(void)
 	splitJoinRead(vn,joinrec);
     }
 
-    HeritageInfo *info = getInfo(piecespace);
-    if (pass != info->delay) continue; // It is too soon to heritage this space
+	// Get the minimum delay amongst all pieces, so that we process the join at the latest possible time before its constituents start getting processed.
+    int delay = INT_MAX;
+    for (int i = 0; i < joinrec->numPieces(); i++) {
+    	AddrSpace *piecespace = joinrec->getPiece(i).space;
+        HeritageInfo *info = getInfo(piecespace);
+        delay = info->delay > delay ? delay : info->delay;
+    }
+    if (pass != delay) continue; // It is too soon to heritage this space
     
     if (joinrec->isFloatExtension())
       floatExtensionWrite(vn,joinrec);
