@@ -4623,22 +4623,36 @@ int4 RuleSubZext::applyOp(PcodeOp *op,Funcdata &data)
     basevn = subop->getIn(0);
     if (basevn->isFree()) return 0;
     if (basevn->getSize() != op->getOut()->getSize()) return 0;	// Truncating then extending to same size
-    if (subop->getIn(1)->getOffset() != 0) { // If truncating from middle
-      if (subvn->loneDescend() != op) return 0; // and there is no other use of the truncated value
-      Varnode *newvn = data.newUnique(basevn->getSize(),(Datatype *)0);
-      constvn = subop->getIn(1);
-      uintb val = constvn->getOffset() * 8;
-      data.opSetInput(op,newvn,0);
-      data.opSetOpcode(subop,CPUI_INT_RIGHT); // Convert the truncation to a shift
-      data.opSetInput(subop,data.newConstant(constvn->getSize(),val),1);
-      data.opSetOutput(subop,newvn);
+    if (subop->getIn(1)->getOffset() == 0) { // If truncating to beginning
+        data.opSetInput(op,basevn,0); // Bypass the truncation entirely
+        val = calc_mask(subvn->getSize());
+        constvn = data.newConstant(basevn->getSize(),val);
+        data.opSetOpcode(op,CPUI_INT_AND);
+        data.opInsertInput(op,constvn,1);
     }
-    else
-      data.opSetInput(op,basevn,0); // Otherwise, bypass the truncation entirely
-    val = calc_mask(subvn->getSize());
-    constvn = data.newConstant(basevn->getSize(),val);
-    data.opSetOpcode(op,CPUI_INT_AND);
-    data.opInsertInput(op,constvn,1);
+    else if (subop->getIn(1)->getOffset() + subvn->getSize() == basevn->getSize()) { // If truncating from end
+    	// Masking isn't necessary, turn the zext into a shift
+        data.opSetInput(op,basevn,0);
+        constvn = subop->getIn(1);
+        uintb val = constvn->getOffset() * 8;
+        data.opSetOpcode(op,CPUI_INT_RIGHT);
+        data.opInsertInput(op,data.newConstant(constvn->getSize(),val),1);
+    }
+    else { // If truncating from middle
+        if (subvn->loneDescend() != op) return 0; // and there is no other use of the truncated value
+        Varnode *newvn = data.newUnique(basevn->getSize(),(Datatype *)0);
+        constvn = subop->getIn(1);
+        uintb val = constvn->getOffset() * 8;
+        data.opSetInput(op,newvn,0);
+        data.opSetOpcode(subop,CPUI_INT_RIGHT); // Convert the truncation to a shift
+        data.opSetInput(subop,data.newConstant(constvn->getSize(),val),1);
+        data.opSetOutput(subop,newvn);
+        data.opSetInput(op,basevn,0); // Mask off the result
+        val = calc_mask(subvn->getSize());
+        constvn = data.newConstant(basevn->getSize(),val);
+        data.opSetOpcode(op,CPUI_INT_AND);
+        data.opInsertInput(op,constvn,1);
+    }
     return 1;
   }
   else if (subop->code() == CPUI_INT_RIGHT) {
