@@ -622,6 +622,7 @@ extern uintb extend_signbit(uintb val,int4 numbits,int4 size);	///< Extend a sig
 extern void byte_swap(intb &val,int4 size);		///< Swap bytes in the given value
 
 extern uintb byte_swap(uintb val,int4 size);		///< Return the given value with bytes swapped
+extern uintb bit_swap(uintb val);			///< Return the given value with bits swapped
 extern int4 leastsigbit_set(uintb val);			///< Return index of least significant bit set in given value
 extern int4 mostsigbit_set(uintb val);			///< Return index of most significant bit set in given value
 extern int4 popcount(uintb val);			///< Return the number of one bits in the given value

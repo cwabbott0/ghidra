@@ -964,6 +964,23 @@ uintb byte_swap(uintb val,int4 size)
   return res;
 }
 
+/// Swap the bits of \b val
+/// \param val is the value to swap
+/// \return the swapped value
+uintb bit_swap(uintb val)
+
+{
+  uintb res=0;
+  int4 size = sizeof(uintb) * 8;
+  while(size>0) {
+    res <<= 1;
+    res |= (val&0x1);
+    val >>= 1;
+    size -= 1;
+  }
+  return res;
+}
+
 /// The least significant bit is index 0.
 /// \param val is the given value
 /// \return the index of the least significant set bit, or -1 if none are set

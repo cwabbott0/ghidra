@@ -18,6 +18,9 @@
 #include "rangeutil.hh"
 #include "multiprecision.hh"
 
+#include <cassert>
+#include <iostream>
+
 namespace ghidra {
 
 /// \class RuleEarlyRemoval
@@ -11023,6 +11026,377 @@ int4 RuleExpandLoad::applyOp(PcodeOp *op,Funcdata &data)
     data.opSetOutput(subOp, outVn);		// Original LOAD output is now defined by SUBPIECE
     data.opInsertAfter(subOp, op);
   }
+  return 1;
+}
+
+/// \class RuleMultCombine
+/// \brief Combine multiplies of low and high bits by reassociating them
+///
+/// Try to determine when a value is multiplied by the same other value with disjoint masks, and combine the masks.
+/// One of the values may be buried inside a summation expression.
+/// (a & mask1) * b + ((1 << shift) * (((a >> shift) & mask2) * b + ...) -> (a & (mask1 | (mask2 << shift))) * b + (1 << shift) * ...
+void RuleMultCombine::getOpList(vector<uint4> &oplist) const
+
+{
+  oplist.push_back(CPUI_INT_ADD);
+}
+
+// A "term" of the form (left & leftMask) * (right & rightMask)
+struct Term {
+  Varnode *inputs[2];
+  uintb masks[2];
+  uint rhsConstant;
+};
+
+// Match a single term
+int4 matchTerm(PcodeOp *op, uintb shiftVal, Term &match)
+{
+  uintb shifts[2] = {0, 0};
+
+  bool matched = false;
+  for (int i = 0; i < 2; i++) {
+    Varnode *vn = op->getIn(i);
+    if (!vn->isWritten()) {
+      match.inputs[i] = vn;
+      match.masks[i] = (1ull << (vn->getSize() * 8)) - 1;
+      continue;
+    }
+    PcodeOp *andOp = vn->getDef();
+    if (andOp->code() != CPUI_INT_AND) {
+      if (andOp->code() == CPUI_INT_RIGHT && andOp->getIn(1)->isConstant()) {
+        match.inputs[i] = vn;
+        match.masks[i] = (1ull << (vn->getSize() * 8)) - (1ull << andOp->getIn(1)->getOffset());
+        shifts[i] = andOp->getIn(1)->getOffset();
+        matched = true;
+      } else {
+        match.inputs[i] = vn;
+        match.masks[i] = (1ull << (vn->getSize() * 8)) - 1;
+      }
+      continue;
+    }
+
+    for (int j = 0; j < 2; j++) {
+      Varnode *mask = andOp->getIn(j);
+      if (!mask->isConstant())
+        continue;
+
+      Varnode *input = andOp->getIn(1-j);
+      if (input->isWritten() && input->getDef()->code() == CPUI_INT_RIGHT &&
+          input->getDef()->getIn(1)->isConstant()) {
+        match.inputs[i] = input->getDef()->getIn(0);
+        shifts[i] = input->getDef()->getIn(1)->getOffset();
+      } else {
+        match.inputs[i] = input;
+      }
+      match.masks[i] = mask->getOffset() << shifts[i];
+      matched = true;
+      break;
+    }
+  }
+  if (!matched)
+    return 0;
+
+  // Make sure the constant operand, if any, is always second
+  if (match.inputs[0]->isConstant()) {
+    std::swap(match.inputs[0], match.inputs[1]);
+    std::swap(match.masks[0], match.masks[1]);
+    std::swap(shifts[0], shifts[1]);
+  }
+
+
+
+  if (match.inputs[1]->isConstant()) {
+    // A constant may include the outer shift value too
+    // e.g. if foo is a 16-bit value, then 5 * foo may become
+    // 5 * (foo & 0xff) + 0x500 * ((foo >> 8) & 0xff)
+    // We want to rewrite 0x500 * ((foo >> 8) & 0xff) to
+    // 5 * (foo & 0xff00).
+    if (shiftVal != 0)
+      return 0;
+    uintb constVal = match.inputs[1]->getOffset();
+    if (constVal & ((1ull << shifts[0]) - 1))
+      return 0;
+    match.rhsConstant = constVal >> shifts[0];
+    return 1;
+  } else if (shifts[0] + shifts[1] == shiftVal) {
+    return 1;
+  }
+
+  return 0;
+}
+
+uint4 matchAddTerms(PcodeOp *op, uint shift, std::vector<Term> &terms, std::vector<Varnode*> &extraTerms);
+
+// Match a collection of terms
+uint4 matchTerms(PcodeOp *op, uint shift, std::vector<Term> &terms, std::vector<Varnode*> &extraTerms)
+{
+   if (op->code() == CPUI_INT_ADD) {
+     return matchAddTerms(op, shift, terms, extraTerms);
+   } else if (op->code() == CPUI_INT_MULT) {
+     // match a left shift which gets turned into a multiplication
+     if (op->getIn(1)->isConstant() && op->getIn(0)->isWritten()) {
+       uintb mulVal = op->getIn(1)->getOffset();
+       if ((mulVal & (mulVal - 1)) == 0) {
+         return matchTerms(op->getIn(0)->getDef(), shift + mostsigbit_set(mulVal), terms, extraTerms);
+       }
+     }
+
+     Term newTerm;
+     if (!matchTerm(op, shift, newTerm))
+       return 0;
+
+     terms.push_back(newTerm);
+     return 1;
+   } else if (op->code() == CPUI_INT_LEFT) {
+     if (op->getIn(1)->isConstant() && op->getIn(0)->isWritten()) {
+       return matchTerms(op->getIn(0)->getDef(), shift + op->getIn(1)->getOffset(), terms, extraTerms);
+     }
+   }
+
+   extraTerms.push_back(op->getOut());
+   return 1;
+}
+
+// Match a collection of terms when we know the root is an addition
+uint4 matchAddTerms(PcodeOp *op, uint shift, std::vector<Term> &terms, std::vector<Varnode*> &extraTerms)
+{
+  for (unsigned i = 0; i < 2; i++) {
+    if (!op->getIn(i)->isWritten()) {
+      extraTerms.push_back(op->getIn(i));
+      continue;
+    }
+    if (!matchTerms(op->getIn(i)->getDef(), shift, terms, extraTerms))
+      return 0;
+  }
+  return 1;
+}
+
+bool compareTermsLHS(Term &term1, Term &term2)
+{
+  return bit_swap(term1.masks[0]) < bit_swap(term2.masks[0]);
+}
+
+bool compareTermsRHS(Term &term1, Term &term2)
+{
+  if (term1.inputs[1]->isConstant())
+    return bit_swap(term1.inputs[1]->getOffset()) < bit_swap(term2.inputs[1]->getOffset());
+  else
+    return bit_swap(term1.masks[0]) < bit_swap(term2.masks[0]);
+}
+
+// Ignore "useless" high bits in the mask to normalize terms.
+// For example, (foo & 0xff000000) * (bar & 0x000000ff) is equivalent to
+// (foo & 0xff000000) * (bar & 0xffffffff), assuming foo & bar are 32 bits,
+// because the higher bits of "bar" will overflow the multiplication.
+// Therefore the compiler may not emit those higher bits, but we want to combine
+// this with another multiplication like (foo & 0x000000ff) * (bar & 0xffffffff)
+// where the compiler *must* include all the bits for "bar".
+bool LHSIsCompatible(const Term &term1, const Term &term2)
+{
+  uint term1LowBits = leastsigbit_set(term1.inputs[1]->isConstant() ? term1.rhsConstant : term1.masks[1]);
+  uint term2LowBits = leastsigbit_set(term2.inputs[1]->isConstant() ? term2.rhsConstant : term2.masks[1]);
+  uintb term1Mask = (1ull << (term1.inputs[0]->getSize() * 8 - term1LowBits)) - 1;
+  uintb term2Mask = (1ull << (term2.inputs[0]->getSize() * 8 - term2LowBits)) - 1;
+  return (term1.masks[0] & term2Mask) == (term2.masks[0] & term1Mask);
+}
+
+bool RHSIsCompatible(const Term &term1, const Term &term2)
+{
+  uint term1LowBits = leastsigbit_set(term1.masks[0]);
+  uint term2LowBits = leastsigbit_set(term2.masks[0]);
+  uintb term1Mask = (1ull << (term1.inputs[1]->getSize() * 8 - term1LowBits)) - 1;
+  uintb term2Mask = (1ull << (term2.inputs[1]->getSize() * 8 - term2LowBits)) - 1;
+  if (term1.inputs[1]->isConstant())
+    return (term1.rhsConstant & term2Mask) == (term2.rhsConstant & term1Mask);
+  else
+    return (term1.masks[1] & term2Mask) == (term2.masks[1] & term1Mask);
+}
+
+int4 mergeLHS(std::vector<Term> &terms, std::vector<Term> &newTerms)
+{
+  std::sort(terms.begin(), terms.end(), compareTermsLHS);
+
+  // The new combined term we're building up
+  Term newTerm = terms[0];
+
+  bool merged = false;
+
+  for (int i = 1; i < terms.size(); ++i) {
+    Term *term = &terms[i];
+    if (!LHSIsCompatible(newTerm, *term)) {
+      // the LHS has changed, emit the new term
+      newTerms.push_back(newTerm);
+      // setup the new term
+      newTerm = *term;
+      continue;
+    }
+
+    // Merge term with newTerm
+    newTerm.masks[0] |= term->masks[0];
+    if (term->inputs[1]->isConstant()) {
+      newTerm.rhsConstant += term->rhsConstant;
+    } else {
+      if (newTerm.inputs[1] != term->inputs[1])
+        return 0;
+      if (newTerm.masks[1] & term->masks[1])
+        return 0;
+      newTerm.masks[1] |= term->masks[1];
+    }
+    merged = true;
+  }
+  newTerms.push_back(newTerm);
+  return merged;
+}
+
+int4 mergeRHS(std::vector<Term> &terms, std::vector<Term> &newTerms)
+{
+  std::sort(terms.begin(), terms.end(), compareTermsRHS);
+
+  // The new combined term we're building up
+  Term newTerm = terms[0];
+
+  bool merged = false;
+
+  for (int i = 1; i < terms.size(); ++i) {
+    Term *term = &terms[i];
+    if (!RHSIsCompatible(newTerm, *term)) {
+      // the RHS has changed, emit the new term
+      newTerms.push_back(newTerm);
+      // setup the new term
+      newTerm = *term;
+      continue;
+    }
+
+    // Merge term with newTerm
+    if (newTerm.inputs[0] != term->inputs[0])
+      return 0;
+    if (newTerm.masks[0] & term->masks[0])
+      return 0;
+
+    if (term->inputs[1]->isConstant())
+      newTerm.rhsConstant |= term->rhsConstant;
+    else
+      newTerm.masks[1] |= term->masks[1];
+    newTerm.masks[0] |= term->masks[0];
+    merged = true;
+  }
+  newTerms.push_back(newTerm);
+  return merged;
+}
+
+void dumpTerms(const std::vector<Term> &terms)
+{
+  for (auto &term : terms) {
+    term.inputs[0]->printRaw(std::cout);
+    std::cout << " & 0x" << hex << term.masks[0] << " * ";
+    if (term.inputs[1]->isConstant()) {
+      std::cout << "0x" << hex << term.rhsConstant;
+    } else {
+      term.inputs[1]->printRaw(std::cout);
+      std::cout << " & 0x" << hex << term.masks[1];
+    }
+    std::cout << " + ";
+  }
+}
+
+int4 RuleMultCombine::applyOp(PcodeOp *op,Funcdata &data)
+{
+  std::vector<Term> terms;
+  std::vector<Varnode*> extraTerms;
+
+  if (!matchAddTerms(op, 0, terms, extraTerms))
+    return 0;
+
+  if (terms.size() < 2)
+    return 0;
+
+  for (int i = 1; i < terms.size(); ++i) {
+    Term *term = &terms[i];
+    if (term->inputs[0] != terms[0].inputs[0])
+      return 0;
+    if (terms[0].inputs[1]->isConstant() != term->inputs[1]->isConstant())
+      return 0;
+  }
+
+  //std::cout << "Initial terms:\n";
+  //dumpTerms(terms);
+  //std::cout << std::endl;
+
+  std::vector<Term> newTerms;
+
+  bool progress = true;
+  while (progress) {
+    progress = false;
+
+    progress |= mergeLHS(terms, newTerms);
+    std::swap(terms, newTerms);
+    newTerms.clear();
+
+    progress |= mergeRHS(terms, newTerms);
+    std::swap(terms, newTerms);
+    newTerms.clear();
+  }
+
+  //std::cout << "Final terms:\n";
+  //dumpTerms(terms);
+  //std::cout << std::endl;
+
+  if (terms.size() > 1)
+    return 0;
+
+  Term finalTerm = terms[0];
+
+  // Emit the single collapsed term
+  PcodeOp* lhsAnd = data.newOp(2, op->getAddr());
+  data.opSetOpcode(lhsAnd, CPUI_INT_AND);
+  data.opSetInput(lhsAnd, finalTerm.inputs[0], 0);
+  data.opSetInput(lhsAnd, data.newConstant(finalTerm.inputs[0]->getSize(), finalTerm.masks[0]), 1);
+  data.opInsertBefore(lhsAnd, op);
+  Varnode *lhs = data.newUniqueOut(finalTerm.inputs[0]->getSize(), lhsAnd);
+
+  Varnode *rhs;
+  if (finalTerm.inputs[1]->isConstant()) {
+    rhs = data.newConstant(finalTerm.inputs[0]->getSize(), finalTerm.rhsConstant);
+  } else {
+    PcodeOp* rhsAnd = data.newOp(2, op->getAddr());
+    data.opSetOpcode(rhsAnd, CPUI_INT_AND);
+    data.opSetInput(rhsAnd, finalTerm.inputs[1], 0);
+    data.opSetInput(rhsAnd, data.newConstant(finalTerm.inputs[1]->getSize(), finalTerm.masks[1]), 1);
+    data.opInsertBefore(rhsAnd, op);
+    rhs = data.newUniqueOut(finalTerm.inputs[1]->getSize(), rhsAnd);
+  }
+
+  if (extraTerms.size() > 0) {
+    Varnode *vn = NULL;
+    for (auto &extraTerm : extraTerms) {
+      if (!vn) {
+        vn = extraTerm;
+        continue;
+      }
+
+      PcodeOp *add = data.newOp(2, op->getAddr());
+      data.opSetOpcode(add, CPUI_INT_ADD);
+      data.opSetInput(add, vn, 0);
+      data.opSetInput(add, extraTerm, 1);
+      data.opInsertBefore(add, op);
+      vn = data.newUniqueOut(vn->getSize(), add);
+    }
+
+    PcodeOp *mul = data.newOp(2, op->getAddr());
+    data.opSetOpcode(mul, CPUI_INT_MULT);
+    data.opSetInput(mul, lhs, 0);
+    data.opSetInput(mul, rhs, 1);
+    data.opInsertBefore(mul, op);
+    Varnode *mul_vn = data.newUniqueOut(finalTerm.inputs[0]->getSize(), mul);
+
+    data.opSetInput(op, mul_vn, 0);
+    data.opSetInput(op, vn, 1);
+  } else {
+    data.opSetOpcode(op, CPUI_INT_MULT);
+    data.opSetInput(op, lhs, 0);
+    data.opSetInput(op, rhs, 1);
+  }
+
   return 1;
 }
 
