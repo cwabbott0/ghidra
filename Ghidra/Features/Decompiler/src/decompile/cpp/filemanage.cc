@@ -307,7 +307,7 @@ void FileManage::splitPath(const string &full,string &path,string &base)
   // If there is no path, i.e. only a basename in full, then -path- will return as an empty string
   // otherwise -path- will be non-empty and end in a separator character
   string::size_type end = full.size()-1;
-  if (isSeparator(full[full.size()-1])) // Take into account terminating separator
+  if (full.size() != 0 && isSeparator(full[full.size()-1])) // Take into account terminating separator
     end = full.size()-2;
   string::size_type pos = full.find_last_of(separatorClass,end);
   if (pos == string::npos) {	// Didn't find any separator
